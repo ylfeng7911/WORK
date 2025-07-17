@@ -1,0 +1,4 @@
+# ninja log v5
+1	4095	1749215122262429229	/home/sdc/fengyulei_space/Deformable-DETR/models/ops/build/temp.linux-x86_64-cpython-38/home/sdc/fengyulei_space/Deformable-DETR/models/ops/src/cpu/ms_deform_attn_cpu.o	ca88118764523968
+1	17625	1749215135786507796	/home/sdc/fengyulei_space/Deformable-DETR/models/ops/build/temp.linux-x86_64-cpython-38/home/sdc/fengyulei_space/Deformable-DETR/models/ops/src/cuda/ms_deform_attn_cuda.o	7f4ec4b0a6125bc8
+1	17921	1749215136086509537	/home/sdc/fengyulei_space/Deformable-DETR/models/ops/build/temp.linux-x86_64-cpython-38/home/sdc/fengyulei_space/Deformable-DETR/models/ops/src/vision.o	bc76e292cc8ca053
