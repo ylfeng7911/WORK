@@ -192,7 +192,7 @@ class DeformableDETR(nn.Module):
 
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}   #最后一层的分类和回归框输出
         if self.aux_loss:       #辅助损失（DECODER的中间层预测，用于加速模型收敛）
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord) #out['aux_outputs'][0] ={'aux_outputs':[...] ,'pred_boxes':[...]}
 
         if self.two_stage:
             enc_outputs_coord = enc_outputs_coord_unact.sigmoid()

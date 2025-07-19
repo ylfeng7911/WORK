@@ -443,6 +443,7 @@ class BoltzformerDecoderLayer(nn.Module):
         self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout= 0.0)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
+        self.k = -10.0
 
         # self attention
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
@@ -469,7 +470,9 @@ class BoltzformerDecoderLayer(nn.Module):
 
     def forward(self, tgt, query_pos,src, src_pos, attn_mask,level_index):
         
-        attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False    
+        # attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False        #防止全1  
+        if attn_mask.dtype == torch.float:
+            attn_mask = attn_mask * self.k      #作为float类型时，会直接加到注意力得分上,再softmax
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)     #q=k=实例query      [1,nq,256]
         tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1) #要求[nq,b,c]
@@ -477,21 +480,21 @@ class BoltzformerDecoderLayer(nn.Module):
         tgt = self.norm2(tgt)
 
         # cross attention
-        tgt3 = self.cross_attn(query=self.with_pos_embed(tgt, query_pos).transpose(0, 1),       
+        tgt2 = self.cross_attn(query=self.with_pos_embed(tgt, query_pos).transpose(0, 1),       
                                key=self.with_pos_embed(src[level_index], src_pos[level_index]).transpose(0, 1),     #要求[hw,b,c]
                                value=src[level_index].transpose(0, 1),
                                attn_mask=attn_mask,
                                key_padding_mask=None)[0].transpose(0, 1)
-        tgt4 = tgt3 + self.dropout1(tgt3)
-        tgt5 = self.norm1(tgt4)
+        tgt = tgt + self.dropout1(tgt2)
+        tgt = self.norm1(tgt)
 
         # ffn
-        tgt6 = self.forward_ffn(tgt5)
+        tgt = self.forward_ffn(tgt)
         
-        if torch.isnan(tgt6).any():
+        if torch.isnan(tgt).any():
             print(1)    #可以定位是不是注意力分数爆炸
 
-        return tgt6
+        return tgt
 
 
 class BoltzformerDecoder(nn.Module):
@@ -505,7 +508,7 @@ class BoltzformerDecoder(nn.Module):
         self.bbox_embed = None
         self.class_embed = None
         self.decoder_norm = nn.LayerNorm(hidden_dim, eps=1e-4)
-        self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+        self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)        
         self.num_heads = num_heads
         self.num_feature_levels = num_feature_levels
         self.boltzmann_sampling: dict = {"mask_threshold": 0.5,"do_boltzmann": True,"sample_ratio": 0.1,"base_temp": 1,}
@@ -528,6 +531,11 @@ class BoltzformerDecoder(nn.Module):
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
 
+        # self._debug_decoder_output = self.decoder_norm(output)
+        # self._debug_decoder_output.retain_grad()
+        # self._debug_mask_embed = self.mask_embed(self._debug_decoder_output)
+        # self._debug_mask_embed.retain_grad()
+        
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(intermediate_reference_points)    #返回所有层的输出和参考点
 
@@ -536,7 +544,12 @@ class BoltzformerDecoder(nn.Module):
 
     
     def boltzmann(self, output, max_feature, attn_mask_target_size, layer_id=-1):
-
+        # Boltzman sampling on attention mask
+        threshold = self.boltzmann_sampling["mask_threshold"]  # original threshold for masked attention
+        do_boltzmann = self.boltzmann_sampling["do_boltzmann"]  # whether to do Boltzman sampling
+        sample_ratio = self.boltzmann_sampling["sample_ratio"]  # number of iid samples as a ratio of total number of masked tokens
+        base_temp = self.boltzmann_sampling["base_temp"]  # base temperature for Boltzman sampling
+              
         assert not torch.isnan(output).any(), "Input contains NaN!"
         assert not torch.isinf(output).any(), "Input contains inf!"
         
@@ -547,45 +560,46 @@ class BoltzformerDecoder(nn.Module):
         mask_embed = self.mask_embed(decoder_output)
         attn_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, max_feature)
 
-        attn_mask = F.interpolate(
-            attn_mask,
-            size=attn_mask_target_size,
-            mode="bilinear",
-            align_corners=False,
-        )
+        attn_mask = F.interpolate(attn_mask, size= attn_mask_target_size, mode="bilinear", align_corners=False)
+        
         attn_mask = (
             attn_mask.sigmoid() #归一化
             .flatten(2)
             .unsqueeze(1)
             .repeat(1, self.num_heads, 1, 1)
             .flatten(0, 1)
-        ).detach()          #[b,q,h,w] -> [b * n_head, nq, hw]
+        )       #[b,q,h,w] -> [b * n_head, nq, hw]          .detach()   
 
-        # Boltzman sampling on attention mask
-        threshold = self.boltzmann_sampling["mask_threshold"]  # original threshold for masked attention
-        do_boltzmann = self.boltzmann_sampling["do_boltzmann"]  # whether to do Boltzman sampling
-        sample_ratio = self.boltzmann_sampling["sample_ratio"]  # number of iid samples as a ratio of total number of masked tokens
-        base_temp = self.boltzmann_sampling["base_temp"]  # base temperature for Boltzman sampling
+        
         
         if do_boltzmann:
-            torch.manual_seed(42 + layer_id)  # 不同层使用不同种子避免重复
-            torch.cuda.manual_seed_all(42 + layer_id)
+            # torch.manual_seed(42 + layer_id)  # 不同层使用不同种子避免重复
+            # torch.cuda.manual_seed_all(42 + layer_id)
             # probability of Boltzman sampling
             Temp = base_temp / (2 + layer_id)  # temperature decays with layer number (first layer from id -1)
             boltzmann_prob = torch.exp(attn_mask / Temp)
             boltzmann_prob = (boltzmann_prob * (attn_mask < threshold).float())  # remove unmasked regions
-            boltzmann_prob = boltzmann_prob / boltzmann_prob.sum(dim=-1, keepdim=True)
-
+            boltzmann_prob = boltzmann_prob / (boltzmann_prob.sum(dim=-1, keepdim=True) + 1e-6)
+            
+            assert not torch.isnan(boltzmann_prob).any(), f"NaN detected in attn_mask in layer {layer_id} in 1"
+            
             # sample from Boltzman distribution n times
-            n_samples = int(attn_mask.shape[-1] * sample_ratio)  # number of iid samples on the tokens
+            n_samples = int(attn_mask.shape[-1] * sample_ratio)  # number of iid samples on the tokens    HW/10
             masked_prob = (1 - boltzmann_prob) ** n_samples  # probability that each token is still masked after n iid samples
-            boltzmann_mask = (torch.rand_like(boltzmann_prob) < masked_prob).bool()
-
+           
+            
+            rand_tensor = torch.rand_like(boltzmann_prob)
+            boltzmann_mask = 1.0 - torch.sigmoid((rand_tensor - masked_prob) * 100)
+            attn_mask = (1.0 - torch.sigmoid((attn_mask - threshold) * 100)) * boltzmann_mask  # 近似 and 操作（可导）
+                
+            #1.直接离散
+            # boltzmann_mask = (torch.rand_like(boltzmann_prob) < masked_prob).bool()
             # combine with original mask
-            attn_mask = torch.logical_and((attn_mask < threshold).bool(), boltzmann_mask)
+            # attn_mask = torch.logical_and((attn_mask < threshold).bool(), boltzmann_mask)
 
         else:
             attn_mask = (attn_mask < threshold).bool()
+
 
         assert not torch.isnan(attn_mask).any(), f"NaN detected in attn_mask in layer {layer_id}"
 

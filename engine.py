@@ -65,6 +65,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         optimizer.zero_grad()
         losses.backward()
+        # print("decoder_output grad:", model.transformer.decoder._debug_decoder_output.grad is not None)
+        # print("mask_embed grad:", model.transformer.decoder._debug_mask_embed.grad is not None)
         if max_norm > 0:
             grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         else:

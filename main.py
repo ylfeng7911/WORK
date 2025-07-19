@@ -72,7 +72,7 @@ def TB_loss(train_stats, writer, epoch):
 
 
 def get_args_parser():
-    #GPUS_PER_NODE=4 ./tools/run_dist_launch.sh 4 ./configs/r50_deformable_detr.sh
+    #GPUS_PER_NODE=2 ./tools/run_dist_launch.sh 2 ./configs/r50_deformable_detr.sh
     #tensorboard --logdir=./exps --port=6006
     
     #resume要考虑2个问题，1不确定要不要（要不要args.start_epoch != 0），2一定要（改一个bool值）
@@ -85,10 +85,10 @@ def get_args_parser():
     parser.add_argument('--lr_backbone', default=2e-5, type=float)
     parser.add_argument('--lr_linear_proj_names', default=['reference_points', 'sampling_offsets'], type=str, nargs='+')
     parser.add_argument('--lr_linear_proj_mult', default=0.1, type=float)
-    parser.add_argument('--batch_size', default=1, type=int)        #2
+    parser.add_argument('--batch_size', default= 1, type=int)        #2
     parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=200, type=int)           #50
-    parser.add_argument('--lr_drop', default=160, type=int)          #40             
+    parser.add_argument('--epochs', default=300, type=int)           #50
+    parser.add_argument('--lr_drop', default=200, type=int)          #40             
     parser.add_argument('--lr_drop_epochs', default=None, type=int, nargs='+')  #和上面的区别是：每隔多久衰减  /在第几回合衰减
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
@@ -118,7 +118,7 @@ def get_args_parser():
     # * Transformer
     parser.add_argument('--enc_layers', default=6, type=int,
                         help="Number of encoding layers in the transformer")
-    parser.add_argument('--dec_layers', default=6, type=int,            #6
+    parser.add_argument('--dec_layers', default=9, type=int,            #6
                         help="Number of decoding layers in the transformer")
     parser.add_argument('--dim_feedforward', default=1024, type=int,
                         help="Intermediate size of the feedforward layers in the transformer blocks")
@@ -162,7 +162,7 @@ def get_args_parser():
 
     # dataset parameters
     parser.add_argument('--dataset_file', default='coco')
-    parser.add_argument('--coco_path', default='/home/fengyulei/fengyulei_space/Data/MultiUAV-Dataset/TinyTinyCoco_format', type=str)
+    parser.add_argument('--coco_path', default='/root/dataset/TinyTinyCoco_format', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
 
@@ -268,8 +268,8 @@ def main(args):
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
 
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
-        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
 
     if args.dataset_file == "coco_panoptic":
