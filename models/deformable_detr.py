@@ -55,7 +55,7 @@ class DeformableDETR(nn.Module):
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.num_feature_levels = num_feature_levels
         if not two_stage:
-            self.query_embed = nn.Embedding(num_queries, hidden_dim*2)      #300 x 512 的嵌入层，表示有300个嵌入向量，每个向量维度512，前256表示内容，后256表示参考点
+            self.query_embed = nn.Embedding(num_queries, hidden_dim*3)      #300 x 512 的嵌入层，表示有300个嵌入向量，每个向量维度512，前256表示内容，后256表示参考点
         if num_feature_levels > 1:      #多尺度
             num_backbone_outs = len(backbone.strides) #3，对应下采样倍数strides=[8, 16, 32]
             input_proj_list = []

@@ -205,18 +205,19 @@ class DeformableTransformer(nn.Module):
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
             query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
         else:
-            query_embed, tgt = torch.split(query_embed, c, dim=1)   #分成两份，用于参考点（位置查询）和内容查询（用于预测的实例）
+            query_embed, tgt, tgt_mask = torch.split(query_embed, c, dim=1)   #分成两份，用于参考点（位置查询）和内容查询（用于预测的实例）
             query_embed = query_embed.unsqueeze(0).expand(bs, -1, -1)   # nq,256 --> 1,nq,256
             tgt = tgt.unsqueeze(0).expand(bs, -1, -1)   # nq,256 --> 1,nq,256   都加上bs维度
+            tgt_mask = tgt_mask.unsqueeze(0).expand(bs, -1, -1) 
             reference_points = self.reference_points(query_embed).sigmoid()     #query  (学习)-->  参考点   [bs,nq,2]
             init_reference_out = reference_points
 
-        unstacked_memory = self.unstack_features(memory, spatial_shapes_list)        #[b,hw,c]
-        max_feature =   srcs[0]       #[b,c,h,w]  换成最大特征图？
+        # unstacked_memory = self.unstack_features(memory, spatial_shapes_list)        #[b,hw,c]
+        # max_feature =   srcs[0]       #[b,c,h,w]  换成最大特征图？
     
         # decoder
-        hs, inter_references = self.decoder(tgt, query_embed, unstacked_memory, lvl_pos_embed_flatten_list, 
-                                            reference_points, spatial_shapes_list, max_feature)
+        hs, inter_references = self.decoder(tgt, reference_points, memory,spatial_shapes, level_start_index,
+                                            valid_ratios, tgt_mask, query_embed, mask_flatten)
 
     
         inter_references_out = inter_references
@@ -440,16 +441,16 @@ class BoltzformerDecoderLayer(nn.Module):
         super().__init__()
 
         # cross attention
-        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout= 0.0)
+        self.cross_attn = MSDeformAttn(d_model, n_levels, n_heads, n_points)
         self.dropout1 = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(d_model)
-        self.k = -10.0
-
+        
         # self attention
         self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(d_model)
-
+        self.k = -1e9
+        
         # ffn
         self.linear1 = nn.Linear(d_model, d_ffn)
         self.activation = _get_activation_fn(activation)
@@ -468,33 +469,48 @@ class BoltzformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt)
         return tgt
 
-    def forward(self, tgt, query_pos,src, src_pos, attn_mask,level_index):
-        
+    def forward(self, tgt, query_pos, reference_points, src, src_spatial_shapes, level_start_index, tgt_mask, attn_mask, src_padding_mask=None):        
         # attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False        #防止全1  
         if attn_mask.dtype == torch.float:
             attn_mask = attn_mask * self.k      #作为float类型时，会直接加到注意力得分上,再softmax
         # self attention
         q = k = self.with_pos_embed(tgt, query_pos)     #q=k=实例query      [1,nq,256]
-        tgt2 = self.self_attn(q.transpose(0, 1), k.transpose(0, 1), tgt.transpose(0, 1))[0].transpose(0, 1) #要求[nq,b,c]
+        tgt2 = self.self_attn(q.transpose(0, 1), 
+                              k.transpose(0, 1), 
+                              tgt.transpose(0, 1),
+                              attn_mask=attn_mask,
+                              )[0].transpose(0, 1) #要求[nq,b,c]
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-
         # cross attention
-        tgt2 = self.cross_attn(query=self.with_pos_embed(tgt, query_pos).transpose(0, 1),       
-                               key=self.with_pos_embed(src[level_index], src_pos[level_index]).transpose(0, 1),     #要求[hw,b,c]
-                               value=src[level_index].transpose(0, 1),
-                               attn_mask=attn_mask,
-                               key_padding_mask=None)[0].transpose(0, 1)
+        tgt2 = self.cross_attn(self.with_pos_embed(tgt, query_pos),             #可分解注意力   reference_points是可学习的
+                               reference_points,
+                               src, src_spatial_shapes, level_start_index, src_padding_mask)    #结果[1,nq,256]
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-
         # ffn
         tgt = self.forward_ffn(tgt)
         
-        if torch.isnan(tgt).any():
-            print(1)    #可以定位是不是注意力分数爆炸
-
-        return tgt
+        
+        # self attention
+        q = k = self.with_pos_embed(tgt_mask, query_pos)     #q=k=实例query      [1,nq,256]
+        tgt_mask2 = self.self_attn(q.transpose(0, 1), 
+                              k.transpose(0, 1), 
+                              tgt_mask.transpose(0, 1),
+                              attn_mask=attn_mask,
+                              )[0].transpose(0, 1) #要求[nq,b,c]
+        tgt_mask = tgt_mask + self.dropout2(tgt_mask2)
+        tgt_mask = self.norm2(tgt_mask)
+        # cross attention
+        tgt_mask2 = self.cross_attn(self.with_pos_embed(tgt_mask, query_pos),             #可分解注意力   reference_points是可学习的
+                               reference_points,
+                               src, src_spatial_shapes, level_start_index, src_padding_mask)    #结果[1,nq,256]
+        tgt_mask = tgt_mask + self.dropout1(tgt_mask2)
+        tgt_mask = self.norm1(tgt_mask)
+        # ffn
+        tgt_mask = self.forward_ffn(tgt_mask)
+        
+        return tgt,tgt_mask
 
 
 class BoltzformerDecoder(nn.Module):
@@ -508,73 +524,57 @@ class BoltzformerDecoder(nn.Module):
         self.bbox_embed = None
         self.class_embed = None
         self.decoder_norm = nn.LayerNorm(hidden_dim, eps=1e-4)
-        self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)        
+        self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)     
         self.num_heads = num_heads
         self.num_feature_levels = num_feature_levels
         self.boltzmann_sampling: dict = {"mask_threshold": 0.5,"do_boltzmann": True,"sample_ratio": 0.1,"base_temp": 1,}
         
-    def forward(self,tgt, query_pos, srcs, srcs_pos, reference_points, spatial_shapes,max_feature ): #query的位置编码就是query参数组的前一半
+    def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,tgt_mask,
+                query_pos=None, src_padding_mask=None): #query的位置编码就是query参数组的前一半
         output = tgt
-
         intermediate = []
         intermediate_reference_points = []
-
-        attn_mask = self.boltzmann(output, max_feature, 
-                                                  attn_mask_target_size = spatial_shapes[0], layer_id=-1)
+        attn_mask = self.boltzmann(output, layer_id=-1)
         for lid, layer in enumerate(self.layers):#解码器层
-            level_index = lid % self.num_feature_levels
-            output = layer(output, query_pos, srcs, srcs_pos,attn_mask,level_index) #src和src_pos都是[b,hw,c]
-
-            attn_mask = self.boltzmann(output, max_feature, 
-                                                  attn_mask_target_size= spatial_shapes[(lid+1) % self.num_feature_levels], layer_id=lid)
+            if reference_points.shape[-1] == 4:
+                reference_points_input = reference_points[:, :, None] \
+                                         * torch.cat([src_valid_ratios, src_valid_ratios], -1)[:, None]
+            else:   #走这里
+                assert reference_points.shape[-1] == 2
+                reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]   #坐标 * 有效范围比例（调整到有效范围）
+            
+            output,tgt_mask = layer(output, query_pos, reference_points_input, src, src_spatial_shapes,
+                                    src_level_start_index,tgt_mask, attn_mask, src_padding_mask)
+            attn_mask = self.boltzmann(tgt_mask, layer_id=lid)
             if self.return_intermediate:    #True
                 intermediate.append(output)
                 intermediate_reference_points.append(reference_points)
-
-        # self._debug_decoder_output = self.decoder_norm(output)
-        # self._debug_decoder_output.retain_grad()
-        # self._debug_mask_embed = self.mask_embed(self._debug_decoder_output)
-        # self._debug_mask_embed.retain_grad()
         
         if self.return_intermediate:
             return torch.stack(intermediate), torch.stack(intermediate_reference_points)    #返回所有层的输出和参考点
-
         return output, reference_points
 
 
     
-    def boltzmann(self, output, max_feature, attn_mask_target_size, layer_id=-1):
+    def boltzmann(self, tgt_mask, layer_id=-1):
         # Boltzman sampling on attention mask
         threshold = self.boltzmann_sampling["mask_threshold"]  # original threshold for masked attention
         do_boltzmann = self.boltzmann_sampling["do_boltzmann"]  # whether to do Boltzman sampling
         sample_ratio = self.boltzmann_sampling["sample_ratio"]  # number of iid samples as a ratio of total number of masked tokens
         base_temp = self.boltzmann_sampling["base_temp"]  # base temperature for Boltzman sampling
               
-        assert not torch.isnan(output).any(), "Input contains NaN!"
-        assert not torch.isinf(output).any(), "Input contains inf!"
-        
-        decoder_output = self.decoder_norm(output)      #[nq,b,c]
-        assert not torch.isnan(decoder_output).any(), f"NaN detected after decoder_norm in layer {layer_id}"
-    
-
-        mask_embed = self.mask_embed(decoder_output)
-        attn_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, max_feature)
-
-        attn_mask = F.interpolate(attn_mask, size= attn_mask_target_size, mode="bilinear", align_corners=False)
+        decoder_output = self.decoder_norm(tgt_mask)      #[b,nq,c]
+        mask_embed = self.mask_embed(decoder_output)        #[b,nq,c]
+        attn_mask = torch.matmul(mask_embed, mask_embed.transpose(-1, -2)) / (mask_embed.shape[-1] ** 0.5)  #自交互 [b,nq,nq]
         
         attn_mask = (
             attn_mask.sigmoid() #归一化
-            .flatten(2)
             .unsqueeze(1)
             .repeat(1, self.num_heads, 1, 1)
             .flatten(0, 1)
-        )       #[b,q,h,w] -> [b * n_head, nq, hw]          .detach()   
+        )       #[b, nq, nq] -> [b * n_head, nq, nq]          .detach()   
 
-        
-        
         if do_boltzmann:
-            # torch.manual_seed(42 + layer_id)  # 不同层使用不同种子避免重复
-            # torch.cuda.manual_seed_all(42 + layer_id)
             # probability of Boltzman sampling
             Temp = base_temp / (2 + layer_id)  # temperature decays with layer number (first layer from id -1)
             boltzmann_prob = torch.exp(attn_mask / Temp)
@@ -586,23 +586,12 @@ class BoltzformerDecoder(nn.Module):
             # sample from Boltzman distribution n times
             n_samples = int(attn_mask.shape[-1] * sample_ratio)  # number of iid samples on the tokens    HW/10
             masked_prob = (1 - boltzmann_prob) ** n_samples  # probability that each token is still masked after n iid samples
-           
-            
+                       
             rand_tensor = torch.rand_like(boltzmann_prob)
             boltzmann_mask = 1.0 - torch.sigmoid((rand_tensor - masked_prob) * 100)
             attn_mask = (1.0 - torch.sigmoid((attn_mask - threshold) * 100)) * boltzmann_mask  # 近似 and 操作（可导）
-                
-            #1.直接离散
-            # boltzmann_mask = (torch.rand_like(boltzmann_prob) < masked_prob).bool()
-            # combine with original mask
-            # attn_mask = torch.logical_and((attn_mask < threshold).bool(), boltzmann_mask)
-
         else:
             attn_mask = (attn_mask < threshold).bool()
-
-
-        assert not torch.isnan(attn_mask).any(), f"NaN detected in attn_mask in layer {layer_id}"
-
         return  attn_mask
     
 
